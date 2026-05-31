@@ -56,7 +56,8 @@ def get_model_name():
 def get_models():
     try:
         response = ollama.Client().list()
-        installed_models = [model['name'] for model in response['models']]
+        print(response)
+        installed_models = [model['model'] for model in response['models']]
         return installed_models
     except Exception as e:
         return {"error": str(e)}
@@ -169,10 +170,10 @@ def extract_sticky_facts(user_input: str) -> list:
 def summarize_conversation(username, messages, previous_summary=None) -> str:
     if previous_summary:
         prompt_request = (
-            "You are summarizing an ongoing conversation. Here is the summary from the previous session(s): "
+            "You are summarizing an ongoing conversation. Here is the summary from the previous session(s):\n"
             f"{previous_summary}\n\n"
-            "And here are the new messages from this session: "
-            f"{json.dumps(messages)}. "
+            "And here are the new messages from this session:\n"
+            f"{json.dumps(messages)}.\n"
             "Please generate an UPDATED summary that combines insights from both the previous summary and these new messages. "
             "Include new topics discussed and maintain context from previous sessions. "
             "Return only a short summary suitable as a system prompt, preserving the user's intent and the assistant's role."
@@ -180,17 +181,25 @@ def summarize_conversation(username, messages, previous_summary=None) -> str:
     else:
         prompt_request = (
             "Please generate a concise summary of this conversation for use as context in future turns. "
-            "The conversation is provided as a JSON array of messages: "
-            f"{json.dumps(messages)}. "
+            "The conversation is provided as a JSON array of messages:\n"
+            f"{json.dumps(messages)}.\n"
             "Return only a short summary suitable as a system prompt, preserving the user's intent and the assistant's role, without additional explanation."
         )
     try:
+        # 1. Generate the conversational baseline summary
         response = generate(model=MODEL_NAME, prompt=prompt_request)
-        features_extracted = extract_sticky_facts(prompt_request)
-        print(f"Features extracted: {features_extracted}")
+        summary_text = response.get("response", "").strip()
+        
+        # 2. FIXED: Extract long-term facts from the *actual summary content* or message log
+        # Passing the raw conversations string works best for granular detail extraction
+        conversation_string = "\n".join([f"{m['role']}: {m['content']}" for m in messages if m["role"] != "system"])
+        features_extracted = extract_sticky_facts(conversation_string)
+        
+        print(f"✨ Features extracted for memory database: {features_extracted}")
         for feature in features_extracted:
             save_sticky_fact_to_db(username, feature["fact"], feature["category"])
-        return response.get("response", "").strip()
+            
+        return summary_text
     except Exception as e:
         print(f"Error during summarization: {e}")
         return ""
@@ -314,7 +323,6 @@ def send_message(filename: str, username: str = Body(...), message: str = Body(.
     chat_content = session_manager.load_chat_content(filename)
     
     if not chat_content:
-        # Fallback if session file doesn't exist
         chat_content = {
             "messages": INITIAL_MESSAGE.copy(),
             "summarized_context": None
@@ -322,35 +330,38 @@ def send_message(filename: str, username: str = Body(...), message: str = Body(.
     
     messages = chat_content.get("messages", [])
     saved_summary = chat_content.get("summarized_context", None)
-    matched_memories = recall_relevant_memories(username, message, limit=2)
-    if matched_memories:
-            # Inject the memories into the conversation history to give the LLM context
-        memory_prompt = (
-            "The user previously mentioned these relevant facts (use them to maintain continuity):\n" + 
-            "\n".join([f"- {m}" for m in matched_memories])
-        )
-        # Insert this 'sticky memory' context after the system prompt
-        messages.insert(1, {"role": "system", "content": memory_prompt})
-    # Add new user message to the context
+    
+    # Add new user message to the historical log array *first*
     messages.append({"role": "user", "content": message})
     
-    # We will return a streaming response using Server-Sent Events (SSE)
     async def sse_response_generator():
         nonlocal messages, saved_summary
         full_assistant_reply = ""
         is_closed_by_assistant = False
         
         try:
-            # Prepare message array for Ollama
-            # If the conversation is summarized and contains a summary, prepend it
-            ollama_messages = messages.copy()
+            # FIXED: Create a completely decoupled copies for execution context
+            # This protects history from cumulative mutation clutter
+            ollama_messages = []
+            
+            # 1. Construct temporary system prompt layout
+            dynamic_system_content = f"{SYSTEM_INSTRUCTION}"
             if saved_summary:
-                ollama_messages = [
-                    {
-                        "role": "system",
-                        "content": f"{SYSTEM_INSTRUCTION}\n\nHere is a summary of the previous conversation: {saved_summary}"
-                    }
-                ] + [m for m in messages if m["role"] != "system"]
+                dynamic_system_content += f"\n\nHere is a summary of the previous conversation: {saved_summary}"
+                
+            # 2. Retrieve vector memories for this specific input turn
+            matched_memories = recall_relevant_memories(username, message, limit=2)
+            if matched_memories:
+                memory_prompt = (
+                    "\n\nThe user previously mentioned these relevant facts (use them to maintain continuity):\n" + 
+                    "\n".join([f"- {m}" for m in matched_memories])
+                )
+                dynamic_system_content += memory_prompt
+                
+            # 3. Compile the pristine execution payload for Ollama
+            ollama_messages.append({"role": "system", "content": dynamic_system_content})
+            # Add all user/assistant historical messages, skipping old embedded system objects
+            ollama_messages.extend([m for m in messages if m["role"] != "system"])
 
             # Stream responses from Ollama
             loop = asyncio.get_event_loop()
@@ -363,34 +374,31 @@ def send_message(filename: str, username: str = Body(...), message: str = Body(.
                 token = chunk.get("message", {}).get("content", "")
                 if token:
                     full_assistant_reply += token
-                    # Yield token as SSE data block
                     yield f"data: {json.dumps({'token': token})}\n\n"
-                    await asyncio.sleep(0.005) # small sleep to prevent network congestion
+                    await asyncio.sleep(0.005)
             
-            # Check for close commands
             is_closed_by_assistant = "[SESSION_CLOSED]" in full_assistant_reply
             
-            # Append complete reply to the local session message list
+            # Append complete reply to the persistent historical trace array
             messages.append({"role": "assistant", "content": full_assistant_reply})
             
-            # Auto-summarize if session is closing or message list gets too long (e.g. > 10 messages)
-            should_summarize = is_closed_by_assistant or len(messages) > 10
+            # Auto-summarize condition (excluding system frames, look at total clean trace count)
+            clean_message_count = len([m for m in messages if m["role"] != "system"])
+            should_summarize = is_closed_by_assistant or clean_message_count > MESSAGE_CONTEXT_SIZE
             new_summary = saved_summary
             
             if should_summarize and len(messages) > 2:
-                # Trigger LLM summarization in background/executor to not block
                 new_summary = await loop.run_in_executor(
                     None,
                     lambda: summarize_conversation(username, messages, saved_summary)
                 )
                 
-            # Save the updated session back to disk
+            # Save cleanly structured context state file back onto local disk storage
             await loop.run_in_executor(
                 None,
                 lambda: session_manager.save_chats(messages, new_summary, filename)
             )
             
-            # Yield end event
             yield f"data: {json.dumps({'done': True, 'session_closed': is_closed_by_assistant})}\n\n"
             
         except Exception as e:
