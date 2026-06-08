@@ -23,7 +23,7 @@ client = chromadb.PersistentClient(path="./memory_vault")
 from chatsession import ChatSession
 
 MODEL_NAME = "llama3.2:latest"
-MESSAGE_CONTEXT_SIZE = 10
+MESSAGE_CONTEXT_SIZE = 2
 SYSTEM_INSTRUCTION = (
     'You are a helpful AI assistant. IMPORTANT: When the user says they want to end the chat '
     '(e.g., "close", "exit", "goodbye", "end", "bye", "quit"), you MUST immediately end your response '
